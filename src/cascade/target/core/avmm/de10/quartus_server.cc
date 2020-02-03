@@ -224,33 +224,57 @@ bool QuartusServer::compile(const std::string& text) {
   if (cache_.find(text) != cache_.end()) {
     return true;
   }
-
   // Otherwise, compile the code and add a new entry to the cache
-  System::execute("mkdir -p /tmp/de10/");
-  char path[] = "/tmp/de10/program_logic_XXXXXX.v";
-  const auto fd = mkstemps(path, 2);
-  const auto dir = string(path).substr(0, 30);
-  close(fd);
 
-  System::execute("cp -R " + System::src_root() + "/share/cascade/de10 " + dir);
-  ofstream ofs(path);
-  ofs << text << endl;
-  ofs.close();
-  System::execute("mv " + string(path) + " " + dir + "/ip/program_logic.v");
+  auto quartus_cmd = [&](const string &cmd) {
+    if (quartus_tunnel_command_.empty()) {
+      return "(" + cmd + ")";
+    } else {
+      string cmd_escaped = "";
+      for (auto c : cmd)
+        cmd_escaped += string("\\") + c;
+      return quartus_tunnel_command_ + " /bin/sh -c '" + cmd_escaped + "'";
+    }
+  };
+  auto write_and_close_file = [](const string &buf, const char *path, int fd) {
+    if (write(fd, buf.c_str(), buf.size()) == -1) {
+      cerr << "failed to write the file " << path << ": " << strerror(errno) << endl;
+    if (close(fd) == -1)
+        cerr << "failed to close the file " << path << ": " << strerror(errno) << endl;
+      return false;
+    }
+    if (close(fd) == -1) {
+      cerr << "failed to close the file " << path << ": " << strerror(errno) << endl;
+      return false;
+    }
+    return true;
+  };
 
-  // Note that kill all will only stop this first script. If control reaches
-  // the second (which should finish quickly), we allow it to run to completion
-  // (and assume it will do so without error).
-  const auto res = System::no_block_execute("cd " + dir + " && ./build_de10.sh \"" + quartus_tunnel_command_ + " " + quartus_path_ + "\"", true);
-  if (res != 0) {
+  char program_logic_path[] = "/tmp/program_logic_XXXXXX.v";
+  if (!write_and_close_file(text, program_logic_path, mkstemps(program_logic_path, 6)))
     return false;
-  }
-  System::no_block_execute("cd " + dir + " && ./assemble_de10.sh \"" + quartus_tunnel_command_ + " " + quartus_path_ + "\"", true);
 
   stringstream ss;
   ss << "bitstream_" << cache_.size() << ".rbf";
   const auto file = ss.str();
-  System::execute("cp " + dir + "/output_files/DE10_NANO_SoC_GHRD.rbf " + cache_path_ + "/" + file);
+ 
+  const auto res = System::no_block_execute(
+    "cd " + System::src_root() + "/share/cascade/de10 && tar czf - . -C /tmp " + &program_logic_path[5] + " | " +
+    quartus_cmd(
+      "dir=$(mkdir -p /tmp/de10 && mktemp /tmp/de10/program_logic_XXXXXX) && "
+      "rm $dir && "
+      "mkdir $dir && "
+      "cd $dir && "
+      "tar xzf - && "
+      "mv " + string(&program_logic_path[5]) + " ip/program_logic.v && "
+      "./build_de10.sh " + quartus_path_ + " >&2 && "
+      "./assemble_de10.sh " + quartus_path_ + " >&2 && "
+      "cat output_files/DE10_NANO_SoC_GHRD.rbf") +
+      " > " + cache_path_ + "/" + file,
+    true
+  );
+  if (res != 0)
+    return false;
 
   ofstream ofs2(cache_path_ + "/index.txt", ios::app);
   ofs2 << text << '\0' << file << '\0';
